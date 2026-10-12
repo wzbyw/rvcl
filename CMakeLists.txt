@@ -109,6 +109,13 @@ endif()
 #   cmake -DRVCL_ENABLE_RVV=ON -DRVCL_ENABLE_IME=OFF ...
 
 # ------------------------------------------------------------------- tests
+# Shared golden helpers: the single data-semantics point for the test
+# executables (differential + bench C mode). Corpus parsers stay
+# deliberately double-implemented — cross-validation is the feature.
+if(RVCL_BUILD_TESTS OR RVCL_BUILD_BENCH)
+    add_library(rvcl_test_golden STATIC tests/golden.c)
+endif()
+
 if(RVCL_BUILD_TESTS)
     enable_testing()
     add_executable(rvcl_smoke tests/smoke_test.c)
@@ -116,7 +123,7 @@ if(RVCL_BUILD_TESTS)
     add_test(NAME smoke COMMAND rvcl_smoke)
 
     add_executable(rvcl_differential tests/differential_test.c)
-    target_link_libraries(rvcl_differential PRIVATE rvcl m)
+    target_link_libraries(rvcl_differential PRIVATE rvcl m rvcl_test_golden)
     add_test(NAME differential COMMAND rvcl_differential)
 endif()
 
