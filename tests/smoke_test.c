@@ -11,8 +11,10 @@
  *   - memory contract: zero-copy import (pointer pass-through), non-plain
  *     layout rejected
  *   - dispatch: (A,B,acc,C) filtering — unsupported tuple rejected,
- *     supported tuple selects reference kernel, wrong shape rejected
- *   - kernel lifecycle: configure reports zero workspace for reference
+ *     supported tuple selects the capability-matched kernel (rvv when the
+ *     RVV feature is detected, reference otherwise), wrong shape rejected
+ *   - kernel lifecycle: configure reports the selected kernel's workspace
+ *     demand (zero for reference, the packed-B buffer for rvv)
  *   - end-to-end: rvcl_matmul matches naive golden
  ******************************************************************************/
 
@@ -102,12 +104,22 @@ int main(void) {
     rvcl_dispatch_result_t *r = NULL;
     CHECK(rvcl_dispatch_matmul(&d, &r) == RVCL_SUCCESS,
             "fp32 tuple dispatches");
-    CHECK(r && strcmp(rvcl_dispatch_kernel_name(r), "rvcl_matmul_f32_reference")
-                    == 0,
-            "selected kernel is reference (only backend)");
+    /* Selection follows host capability: with the RVV feature present the
+     * rvv kernel wins on static priority; without it (e.g. x86 CI hosts)
+     * the reference kernel is the only candidate. Branch on the detected
+     * capability instead of assuming a specific host. */
+    const int host_has_rvv = rvcl_capability_has(cap, RVCL_FEATURE_RVV);
+    const char *expected_kernel = host_has_rvv ? "rvcl_matmul_f32_rvv"
+                                               : "rvcl_matmul_f32_reference";
+    CHECK(r && strcmp(rvcl_dispatch_kernel_name(r), expected_kernel) == 0,
+            host_has_rvv ? "selected kernel is rvv (RVV capability present)"
+                         : "selected kernel is reference (no RVV capability)");
     int num_ws = -1;
     rvcl_dispatch_ws_req(r, &num_ws);
-    CHECK(num_ws == 0, "reference kernel reports zero workspace");
+    /* reference reports no workspace; the rvv kernel reports the packed-B
+     * panel buffer (1 slot) */
+    CHECK(num_ws == (host_has_rvv ? 1 : 0),
+            "selected kernel reports expected workspace count");
     rvcl_dispatch_release(r);
 
     rvcl_matmul_desc_t dbad = d;

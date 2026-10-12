@@ -31,12 +31,12 @@ RISC-V compute extensions are far more heterogeneous than any other architecture
 
 RVCL's answer is the **layered contract that ACL (Arm Compute Library) has already validated in the Arm ecosystem**, ported to RISC-V and extended:
 
-| Layer | Responsibility | In one sentence |
-| ----- | -------------- | --------------- |
-| Capability | Detect hardware features (ISA / datatype extensions / vendor interfaces) | What can this CPU execute? |
-| Registry | Register and index kernel metadata (operation × (A,B,acc,C) dtype tuple) | Which kernel implementations exist? |
-| Dispatch | Multi-stage filtering + scoring, pick the best legal kernel | Which kernel should run? |
-| Kernel | `validate / configure / run` three-phase lifecycle | Do the actual computation. |
+| Layer      | Responsibility                                                            | In one sentence                     |
+| ---------- | ------------------------------------------------------------------------- | ----------------------------------- |
+| Capability | Detect hardware features (ISA / datatype extensions / vendor interfaces)  | What can this CPU execute?          |
+| Registry   | Register and index kernel metadata (operation × (A,B,acc,C) dtype tuple) | Which kernel implementations exist? |
+| Dispatch   | Multi-stage filtering + scoring, pick the best legal kernel               | Which kernel should run?            |
+| Kernel     | `validate / configure / run` three-phase lifecycle                      | Do the actual computation.          |
 
 Two cross-cutting contracts stay under host control, invisible to kernels:
 
@@ -149,14 +149,14 @@ Adding a backend = a new `src/backends/<name>/` directory + one registration lin
 
 ## Roadmap
 
-| Version | Milestone |
-| ------- | --------- |
-| v0.1 | RVV backend (FP32/FP16), differential testing against the reference |
-| v0.2 | IME backend — the first proof of the abstraction's value (same API on a matrix extension) |
-| v0.3 | VME / AME + oneDNN vertical slice (`DNNL_RISCV_USE_RVCL`) |
-| v0.4 | INT8 quantized paths + dispatch cost model (stages 5–7) |
-| v0.5 | Full oneDNN integration + INT4 weight-only + PyTorch support |
-| v1.0 | Stable ABI commitment |
+| Version | Milestone                                                                                  |
+| ------- | ------------------------------------------------------------------------------------------ |
+| v0.1    | RVV backend (FP32/FP16), differential testing against the reference                        |
+| v0.2    | IME backend — the first proof of the abstraction's value (same API on a matrix extension) |
+| v0.3    | VME / AME + oneDNN vertical slice (`DNNL_RV64_USE_RVCL`)                                  |
+| v0.4    | INT8 quantized paths + dispatch cost model (stages 5–7)                                   |
+| v0.5    | Full oneDNN integration + INT4 weight-only + PyTorch support                               |
+| v1.0    | Stable ABI commitment                                                                      |
 
 Full breakdown in PLAN-0001 §5–§6; the first full-stack use case (PyTorch + oneDNN + RVCL) in PLAN-0001 §6.4.1.
 

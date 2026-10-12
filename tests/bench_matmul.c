@@ -208,7 +208,7 @@ int main(int argc, char **argv) {
                     .strides = {cs.n, 1},
                     .dtype = cs.d.dtype_b};
                 rvcl_tensor_t src, dst;
-                rvcl_tensor_init(&src, &td, dt ? cs.bh : cs.b);
+                rvcl_tensor_init(&src, &td, dt ? (void *)cs.bh : (void *)cs.b);
                 rvcl_tensor_desc_t pd = {.ndims = 1,
                     .dims = {(int64_t)pbytes},
                     .strides = {1},
@@ -227,7 +227,7 @@ int main(int argc, char **argv) {
                     .strides = {cs.n, 1},
                     .dtype = cs.d.dtype_b};
                 static rvcl_tensor_t src_t, dst_t;
-                rvcl_tensor_init(&src_t, &td, dt ? cs.bh : cs.b);
+                rvcl_tensor_init(&src_t, &td, dt ? (void *)cs.bh : (void *)cs.b);
                 rvcl_tensor_desc_t pd = {.ndims = 1,
                     .dims = {(int64_t)pbytes},
                     .strides = {1},
@@ -267,12 +267,12 @@ int main(int argc, char **argv) {
                     .dims = {cs.m, cs.k},
                     .strides = {cs.k, 1},
                     .dtype = cs.d.dtype_a};
-                rvcl_tensor_init(&pck.ta, &td, dt ? cs.ah : cs.a);
+                rvcl_tensor_init(&pck.ta, &td, dt ? (void *)cs.ah : (void *)cs.a);
                 td.dims[0] = cs.k;
                 td.dims[1] = cs.n;
                 td.strides[0] = cs.n;
                 td.dtype = cs.d.dtype_b;
-                rvcl_tensor_init(&pck.tb, &td, dt ? cs.bh : cs.b);
+                rvcl_tensor_init(&pck.tb, &td, dt ? (void *)cs.bh : (void *)cs.b);
                 td.dims[0] = cs.m;
                 td.strides[0] = cs.n;
                 td.dtype = cs.d.dtype_c;

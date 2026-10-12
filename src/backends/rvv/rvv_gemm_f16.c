@@ -50,10 +50,15 @@ __attribute__((visibility("default"))) void rvv_gemm_f16_c(const void *a_in, con
 
 /*
  * Same row × panel structure as the f32 kernel: NC-wide fp16 segment
- * widened to fp32 accumulators (vw load + fwcvt), K streamed in order.
- * Zvfh is required for fp16 vector loads (checked at configure/validate
- * time via RVCL_FEATURE_FP16); on Zvfhmin-only parts the backend falls
- * back to scalar conversion.
+ * widened to fp32 accumulators (vw load + fwcvt), K streamed in order,
+ * one strip at a time (RVV types cannot be array elements). Only the
+ * Zvfhmin conversion instructions are used (f16 load + widen to fp32,
+ * fp32 fmacc), so the kernel runs on Zvfhmin-only parts as well; the
+ * FP16 feature gate is checked at dispatch time via RVCL_FEATURE_FP16.
+ *
+ * Bias-first (R4), mirroring rvv_gemm_f32_rvv: fp32 accumulator lanes
+ * are seeded with bias[j] before the K loop — same addition order as the
+ * C path (bias, then converted K products ascending).
  */
 void rvv_gemm_f16_rvv(const void *a_in, const void *b_packed,
         const void *bias_in, void *c_in, int64_t m, int64_t n, int64_t k_dim,
@@ -63,6 +68,7 @@ void rvv_gemm_f16_rvv(const void *a_in, const void *b_packed,
     const float *bias = (const float *)bias_in;
     float *c = (float *)c_in;
     const int64_t NC = RVV_PACK_NC;
+    (void)m;
 
     for (int64_t i = r->m_begin; i < r->m_end; i++) {
         for (int64_t j0 = (r->n_begin / NC) * NC; j0 < r->n_end; j0 += NC) {
@@ -71,34 +77,37 @@ void rvv_gemm_f16_rvv(const void *a_in, const void *b_packed,
 
             const long vl_h = __riscv_vsetvl_e16m1(NC);
             const long nv = (long)((NC + vl_h - 1) / vl_h);
-            vfloat32m2_t acc[RVV_PACK_NC];
-
-            for (long v = 0; v < nv; v++)
-                acc[v] = __riscv_vfmv_v_f_f32m2(0.0f, vl_h);
-
-            for (int64_t p = 0; p < k_dim; p++) {
-                const float av = rvv_f16_to_f32(a[i * k_dim + p]);
-                for (long v = 0; v < nv; v++) {
-                    const long off = v * vl_h;
-                    const long len = (off + vl_h <= NC) ? vl_h : (NC - off);
-                    const vfloat16m1_t bh = __riscv_vle16_v_f16m1(
-                            bpanel + p * NC + off, len);
-                    const vfloat32m2_t bv = __riscv_vfwcvt_f_f16_f32m2(
-                            bh, len);
-                    acc[v] = __riscv_vfmacc_vf_f32m2(acc[v], av, bv, len);
-                }
-            }
 
             for (long v = 0; v < nv; v++) {
                 const long off = v * vl_h;
                 const long len = (off + vl_h <= NC) ? vl_h : (NC - off);
+
+                long blen = len;
+                if (bias) {
+                    /* Clamp to the n valid bias entries (ragged panel);
+                     * lanes past n are filtered out at the store below. */
+                    const long rem = (long)(n - (j0 + off));
+                    blen = rem < len ? rem : len;
+                }
+                vfloat32m2_t acc = (bias && blen > 0)
+                        ? __riscv_vle32_v_f32m2(bias + j0 + off, blen)
+                        : __riscv_vfmv_v_f_f32m2(0.0f, vl_h);
+
+                for (int64_t p = 0; p < k_dim; p++) {
+                    const float av = rvv_f16_to_f32(a[i * k_dim + p]);
+                    const vfloat16m1_t bh = __riscv_vle16_v_f16m1(
+                            (const _Float16 *)(bpanel + p * NC + off),
+                            len);
+                    const vfloat32m2_t bv = __riscv_vfwcvt_f_f_v_f32m2(
+                            bh, len);
+                    acc = __riscv_vfmacc_vf_f32m2(acc, av, bv, len);
+                }
+
                 for (long e = 0; e < len; e++) {
                     const int64_t j = j0 + off + e;
                     if (j < r->n_begin || j >= r->n_end) continue;
-                    float val = __riscv_vfmv_f_s_f32m2_f32(
-                            __riscv_vslidedown_vx_f32m2(acc[v], e, len));
-                    if (bias) val += bias[j];
-                    c[i * n + j] = val;
+                    c[i * n + j] = __riscv_vfmv_f_s_f32m2_f32(
+                            __riscv_vslidedown_vx_f32m2(acc, e, len));
                 }
             }
         }
