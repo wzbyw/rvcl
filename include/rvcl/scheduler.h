@@ -20,6 +20,8 @@ extern "C" {
 #endif
 
 /* Task invoked per work slice: fn(scheduler, slice, user_ctx). */
+struct rvcl_ischeduler; /* forward decl: file scope, not parameter scope */
+
 typedef void (*rvcl_parallel_task_fn)(struct rvcl_ischeduler *,
         const rvcl_work_range_t *slice, void *user_ctx);
 
