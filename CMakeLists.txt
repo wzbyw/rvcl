@@ -19,14 +19,13 @@ set(RVCL_ENABLE_REFERENCE ON)
 
 # Guard against in-source builds: a stale ./CMakeCache.txt next to the
 # sources builds an out-of-date configuration (e.g. RVV disabled) that
-# shadows build/ and breaks `make` at the repo root.
+# shadows build/.
 if(CMAKE_CURRENT_SOURCE_DIR STREQUAL CMAKE_CURRENT_BINARY_DIR)
     file(REMOVE ${CMAKE_CURRENT_SOURCE_DIR}/CMakeCache.txt
                 ${CMAKE_CURRENT_SOURCE_DIR}/CMakeFiles)
     message(FATAL_ERROR
         "In-source builds are disabled. Use:\n"
-        "    cmake -B build && cmake --build build\n"
-        "or simply `make` at the repo root (wrapper Makefile).")
+        "    cmake -B build && cmake --build build")
 endif()
 
 set(RVCL_RUNTIME_SOURCES
@@ -86,10 +85,18 @@ if(RVCL_ENABLE_RVV)
 endif()
 
 # On real RVV targets ensure the vector extension is enabled in -march.
+# rvv_backend.c MUST be in the list: create_f32/create_f16 bind the
+# intrinsics micro-kernels only when __riscv_vector is defined in that
+# translation unit — without the override they silently bind the C
+# fallback and the intrinsics path is unreachable. capability.c MUST be
+# in the list too: the compile-time detection layer only reports RVV /
+# FP16 features when the __riscv_* macros are visible there.
 if(RVCL_ENABLE_RVV AND CMAKE_SYSTEM_PROCESSOR MATCHES "riscv")
     set(RVCL_RVV_MARCH "" CACHE STRING "Extra -march vector flags for RVV files")
     if(RVCL_RVV_MARCH)
         set_source_files_properties(
+            src/runtime/capability.c
+            src/backends/rvv/rvv_backend.c
             src/backends/rvv/rvv_pack.c
             src/backends/rvv/rvv_gemm_f32.c
             src/backends/rvv/rvv_gemm_f16.c

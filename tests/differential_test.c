@@ -9,6 +9,13 @@
  * tolerance. fp32: bit-identical expected (same accumulation order);
  * fp16 storage path: tolerance 1e-3 relative (conversion rounding).
  *
+ * Bit-exactness note for the RVV intrinsics path: vfmacc is a fused
+ * (single-rounding) multiply-add, so the scalar golden must contract
+ * `acc += a * b` to fmadd the same way — build with optimization
+ * (Release / -O2+) on vector builds for the fp32 bit-exact checks to
+ * hold. At -O0 the scalar golden double-rounds and only the tolerance
+ * comparison would pass.
+ *
  * Also covers the v0.1 acceptance criteria (PLAN §6.2):
  *   - scheduler injection does not change numeric results;
  *   - work-range partitioning covers without overlap or gap.
@@ -261,6 +268,16 @@ int main(void) {
     for (int i = 0; i < M * N; i++)
         if (c_ref[i] != c_rvv[i]) diff_backends++;
     CHECK(diff_backends == 0, "reference and rvv f32 outputs identical");
+
+    /* ---- fp32 without bias: NULL-bias branch of the same kernels ---- */
+    golden_f32(a, b, NULL, golden, M, N, K);
+    CHECK(run_named_kernel("rvcl_matmul_f32_rvv", &d32, a, b, NULL, c_rvv)
+                    == RVCL_SUCCESS,
+            "rvv f32 runs without bias");
+    int bad_nobias = 0;
+    for (int i = 0; i < M * N; i++)
+        if (c_rvv[i] != golden[i]) bad_nobias++;
+    CHECK(bad_nobias == 0, "rvv f32 no-bias matches naive golden (bit-exact)");
 
     /* ---- fp16 differential: rvv f16 vs golden soft-convert ---- */
     uint16_t *ah = malloc(M * K * 2), *bh = malloc(K * N * 2);
