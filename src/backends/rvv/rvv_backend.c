@@ -114,6 +114,29 @@ static const rvcl_kernel_vtable_t g_rvv_vtable = {
     .destroy = rvv_destroy,
 };
 
+/* ---------------------------------------------- micro-kernel selection */
+
+/* Single source of truth for the live micro-kernel per dtype (see
+ * rvv_internal.h): the intrinsics kernels only exist under
+ * __riscv_vector in this translation unit; otherwise the C-portable
+ * fallback runs. Bench kernel-only timing calls the same selectors, so
+ * it always measures what dispatch actually bound. */
+__attribute__((visibility("default"))) rvv_gemm_fn rvv_pick_gemm_f32(void) {
+#if defined(__riscv_vector)
+    return rvv_gemm_f32_rvv;
+#else
+    return rvv_gemm_f32_c;
+#endif
+}
+
+__attribute__((visibility("default"))) rvv_gemm_fn rvv_pick_gemm_f16(void) {
+#if defined(__riscv_vector)
+    return rvv_gemm_f16_rvv;
+#else
+    return rvv_gemm_f16_c;
+#endif
+}
+
 /* --------------------------------------------------- per-dtype factories */
 
 static rvcl_status_t make_rvv_kernel(rvcl_kernel_t **out,
@@ -129,20 +152,12 @@ static rvcl_status_t make_rvv_kernel(rvcl_kernel_t **out,
 
 static rvcl_status_t create_f32(rvcl_kernel_t **out,
         const rvcl_kernel_desc_t *desc) {
-#if defined(__riscv_vector)
-    return make_rvv_kernel(out, desc, rvv_gemm_f32_rvv, sizeof(float));
-#else
-    return make_rvv_kernel(out, desc, rvv_gemm_f32_c, sizeof(float));
-#endif
+    return make_rvv_kernel(out, desc, rvv_pick_gemm_f32(), sizeof(float));
 }
 
 static rvcl_status_t create_f16(rvcl_kernel_t **out,
         const rvcl_kernel_desc_t *desc) {
-#if defined(__riscv_vector)
-    return make_rvv_kernel(out, desc, rvv_gemm_f16_rvv, 2);
-#else
-    return make_rvv_kernel(out, desc, rvv_gemm_f16_c, 2);
-#endif
+    return make_rvv_kernel(out, desc, rvv_pick_gemm_f16(), 2);
 }
 
 /* pack entry used by run(): dispatch to the shared panel packer */
