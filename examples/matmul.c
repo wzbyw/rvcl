@@ -37,12 +37,15 @@ int main(void) {
         .dtype_bias = RVCL_DTYPE_FP32,
     };
 
-    /* Show what dispatch selected (the "dispatch once" half of the API). */
+    /* Show what dispatch selected (the "dispatch once" half of the API),
+     * including the workspace configure() actually reported. */
     rvcl_dispatch_result_t *r = NULL;
     if (rvcl_dispatch_matmul(&d, &r) == RVCL_SUCCESS) {
-        printf("dispatch selected: %s (ws=%d)\n",
+        int num_ws = 0;
+        const rvcl_workspace_req_t *ws = rvcl_dispatch_ws_req(r, &num_ws);
+        printf("dispatch selected: %s (ws=%lld)\n",
                 rvcl_dispatch_kernel_name(r),
-                rvcl_dispatch_ws_req(r, NULL) ? 0 : 0);
+                num_ws > 0 ? (long long)ws[0].size : 0LL);
         rvcl_dispatch_release(r);
     }
 
