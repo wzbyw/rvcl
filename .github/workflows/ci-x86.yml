@@ -1,0 +1,59 @@
+name: ci-x86
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - ".github/**"
+      - "cmake/**"
+      - "include/**"
+      - "src/**"
+      - "tests/**"
+      - "examples/**"
+      - "CMakeLists.txt"
+  pull_request:
+    branches: [main]
+    paths:
+      - ".github/**"
+      - "cmake/**"
+      - "include/**"
+      - "src/**"
+      - "tests/**"
+      - "examples/**"
+      - "CMakeLists.txt"
+  workflow_dispatch:
+
+# Stop stale runs when a PR is updated; never cancel main's own runs.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+permissions: read-all
+
+jobs:
+  x86:
+    name: ubuntu-24.04 / gcc / ninja
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout rvcl
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install ninja
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build
+
+      # System cmake 3.28 clears the ctest --test-dir (>= 3.21) floor; no
+      # pinned cmake action needed at this project size.
+      - name: Configure
+        run: cmake -B build -G Ninja -DRVCL_ENABLE_WERROR=ON -DRVCL_TEST_SET=ci
+
+      - name: Build
+        run: cmake --build build
+
+      # Examples are registered inside ctest (RVCL_BUILD_EXAMPLES), so the
+      # test step already runs them.
+      - name: Test
+        run: ctest --test-dir build --output-on-failure
