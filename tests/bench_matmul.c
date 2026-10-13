@@ -460,7 +460,9 @@ static int rig_setup(dispatch_rig_t *g, const case_t *cs) {
     const rvcl_workspace_req_t *ws = rvcl_dispatch_ws_req(g->r, &num_ws);
     for (int i = 0; i < num_ws && i < RVCL_MAX_WORKSPACES; i++) {
         size_t align = ws[i].alignment > 1 ? (size_t)ws[i].alignment : 8;
-        posix_memalign(&g->ws_buf[i], align, (size_t)(ws[i].size + align));
+        if (posix_memalign(&g->ws_buf[i], align,
+                    (size_t)(ws[i].size + align)) != 0)
+            return 0;
         rvcl_tensor_desc_t wd = {.ndims = 1,
             .dims = {ws[i].size + 1},
             .strides = {1},
@@ -719,7 +721,10 @@ int main(int argc, char **argv) {
             size_t elt = dt ? 2 : 4;
             void *packed = NULL;
             size_t pbytes = rvv_packed_b_bytes(cs.k, cs.n, elt);
-            posix_memalign(&packed, 64, pbytes);
+            if (posix_memalign(&packed, 64, pbytes) != 0) {
+                fprintf(stderr, "error: packed-B buffer allocation failed\n");
+                return 1;
+            }
             rvcl_tensor_t b_src, b_dst;
             {
                 rvcl_tensor_desc_t td = {.ndims = 2,
