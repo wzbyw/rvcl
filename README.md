@@ -1,5 +1,8 @@
 # RVCL — RISC-V Compute Library
 
+[![CI x86](https://github.com/zte-riscv/rvcl/actions/workflows/ci-x86.yml/badge.svg?branch=main)](https://github.com/zte-riscv/rvcl/actions/workflows/ci-x86.yml)
+[![CI riscv64](https://github.com/zte-riscv/rvcl/actions/workflows/ci-riscv.yml/badge.svg?branch=main)](https://github.com/zte-riscv/rvcl/actions/workflows/ci-riscv.yml)
+
 **A unified compute kernel abstraction and dispatch runtime for RISC-V vector and matrix architectures — covering RVV, IME, VME, AME and vendor extensions, with capability detection, kernel registry, and framework integration (oneDNN).**
 
 RVCL is a unified kernel abstraction and dispatch runtime for RISC-V vector and matrix architectures: **Capability** (what the hardware can do) → **Registry** (which kernel implementations exist) → **Dispatch** (which kernel should run) → **Kernel** (do the actual computation), with an injectable **Scheduler** and a zero-copy **Memory** contract crossing all layers. The goal: one operator API that automatically selects the best kernel for the current hardware across RVV / IME / VME / AME / vendor extensions, and integrates upward with oneDNN (and through it, frameworks such as PyTorch).
@@ -88,6 +91,23 @@ Backend switches (all OFF by default, enabled per the release roadmap):
 ```bash
 cmake -B build -S . -DRVCL_ENABLE_RVV=ON   # likewise IME / VME / AME
 ```
+
+**Cross-build for rv64 and run under QEMU** (what the riscv64 CI does — see `.github/workflows/ci-riscv.yml` and `.github/automation/riscv/`):
+
+```bash
+sudo apt install gcc-14-riscv64-linux-gnu qemu-user-static ninja-build
+cmake -B build-rv64 -S . -G Ninja \
+    -DCMAKE_BUILD_TYPE=Release \
+    -DCMAKE_TOOLCHAIN_FILE=cmake/toolchains/riscv64.cmake \
+    -DRVCL_TEST_SET=ci \
+    -DRVCL_RVV_MARCH=rv64gcv_zvfh    # vector tier (intrinsics); omit for baseline
+# run one target natively under qemu-user (no binfmt registration needed):
+QEMU_LD_PREFIX=/usr/riscv64-linux-gnu \
+QEMU_CPU="rv64,v=true,zvfh=true,vlen=128,vext_spec=v1.0" \
+    qemu-riscv64-static ./build-rv64/rvcl_capability_assert
+```
+
+The capability gate (`rvcl_capability_assert`) prints the detected feature set and VLEN; set `RVCL_EXPECT_FEATURES=rvv,fp16` to turn it into a hard assertion.
 
 ## Usage Examples
 

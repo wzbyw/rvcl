@@ -1,0 +1,169 @@
+name: ci-riscv
+
+# Cross-compile on x86, execute under QEMU linux-user (the oneDNN
+# ci-riscv pattern). Two build tiers x a vlen matrix:
+#   baseline (rv64gc)  C-fallback kernels + runtime hwprobe upgrade
+#   vector (rv64gcv_zvfh)  intrinsics kernels, compile-time capability
+on:
+  push:
+    branches: [main]
+    paths:
+      - ".github/**"
+      - "cmake/**"
+      - "include/**"
+      - "src/**"
+      - "tests/**"
+      - "examples/**"
+      - "CMakeLists.txt"
+  pull_request:
+    branches: [main]
+    paths:
+      - ".github/**"
+      - "cmake/**"
+      - "include/**"
+      - "src/**"
+      - "tests/**"
+      - "examples/**"
+      - "CMakeLists.txt"
+  workflow_dispatch:
+
+# Stop stale runs when a PR is updated; never cancel main's own runs.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+permissions: read-all
+
+jobs:
+  build:
+    name: cross / ${{ matrix.config.name }}
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        config:
+          - name: baseline
+            tier: baseline
+          - name: vector
+            tier: vector
+    steps:
+      - name: Checkout rvcl
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Read version file
+        id: get-versions
+        run: |
+          content=`cat ${{ github.workspace }}/.github/automation/riscv/ci.json`
+          content="${content//[$'\t\r\n$ ']}"
+          echo "output=$content" >> $GITHUB_OUTPUT
+
+      - name: Install build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build gcc-${{ fromJson(steps.get-versions.outputs.output).dependencies.gcc }}-riscv64-linux-gnu
+
+      - name: Configure rvcl
+        run: ${{ github.workspace }}/.github/automation/riscv/build.sh
+        env:
+          GCC_VERSION: ${{ fromJson(steps.get-versions.outputs.output).dependencies.gcc }}
+          RVCL_ACTION: configure
+          RVCL_CI_TIER: ${{ matrix.config.tier }}
+
+      - name: Build rvcl
+        run: ${{ github.workspace }}/.github/automation/riscv/build.sh
+        env:
+          GCC_VERSION: ${{ fromJson(steps.get-versions.outputs.output).dependencies.gcc }}
+          RVCL_ACTION: build
+
+      - name: Create archive with preserved permissions
+        run: tar -czf build.tar.gz build
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: build-${{ matrix.config.tier }}
+          path: build.tar.gz
+          retention-days: 1
+
+  test:
+    needs: build
+    name: qemu / ${{ matrix.config.name }}
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        config:
+          # capability expectations per tier: the vector tier gets RVV+FP16
+          # from compile-time macros; the baseline tier must upgrade to RVV
+          # through the runtime hwprobe path (also validates that path).
+          # vlen only matters for the intrinsics tier (panel=8 tail paths:
+          # two strips at vlen=128, one at vlen=256), so the baseline
+          # binary runs on a single vlen.
+          - name: baseline-vlen128
+            tier: baseline
+            vlen: 128
+            expect: "rvv"
+          - name: vector-vlen128
+            tier: vector
+            vlen: 128
+            expect: "rvv,fp16"
+          - name: vector-vlen256
+            tier: vector
+            vlen: 256
+            expect: "rvv,fp16"
+    steps:
+      - name: Checkout rvcl
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Read version file
+        id: get-versions
+        run: |
+          content=`cat ${{ github.workspace }}/.github/automation/riscv/ci.json`
+          content="${content//[$'\t\r\n$ ']}"
+          echo "output=$content" >> $GITHUB_OUTPUT
+
+      # Register binfmt for riscv64 (ships QEMU >= 8.2: hwprobe syscall
+      # emulation, verified combo with the cross gcc above).
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
+        with:
+          platforms: riscv64
+
+      # The cross toolchain provides the sysroot (guest loader + glibc)
+      # that QEMU_LD_PREFIX points at.
+      - name: Install cross toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-${{ fromJson(steps.get-versions.outputs.output).dependencies.gcc }}-riscv64-linux-gnu
+
+      - name: Download build artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: build-${{ matrix.config.tier }}
+          path: ${{ github.workspace }}
+
+      - name: Extract archive
+        run: tar -xzf build.tar.gz
+
+      - name: Run rvcl tests
+        run: ${{ github.workspace }}/.github/automation/riscv/test.sh
+        working-directory: ${{ github.workspace }}/build
+        env:
+          CTEST_PARALLEL_LEVEL: "4"
+          QEMU_CPU: "rv64,v=true,zvfh=true,vlen=${{ matrix.config.vlen }},vext_spec=v1.0"
+          RVCL_CI_TIER: ${{ matrix.config.tier }}
+          RVCL_EXPECT_FEATURES: ${{ matrix.config.expect }}
+
+  # This job adds a check named "ci-riscv" that represents overall
+  # workflow status and can be used in branch rulesets.
+  status:
+    needs: [build, test]
+    runs-on: ubuntu-24.04
+    name: "ci-riscv"
+    steps:
+      - name: Print success
+        run: echo Success
