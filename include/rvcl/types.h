@@ -114,7 +114,11 @@ typedef enum {
 
 typedef struct {
     rvcl_feature_id_t id;
-    uint32_t value; /* e.g. VLEN for RVV, tile id for a matrix engine */
+    /* Feature detail: 1 = present with no further detail; for
+     * RVCL_FEATURE_RVV the vector length in bits (128/256/...) when
+     * readable from the host. Presence is queried via
+     * rvcl_capability_has(), never inferred from this field. */
+    uint32_t value;
 } rvcl_feature_t;
 
 /* ------------------------------------------------------------ work ranges */
