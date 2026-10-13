@@ -125,6 +125,17 @@ endif()
 
 if(RVCL_BUILD_TESTS)
     enable_testing()
+
+    # Environment gate, registered first: prints the capability summary
+    # and asserts RVCL_EXPECT_FEATURES (comma list) when set. The
+    # riscv64 CI runs it before any numerical target — a misconfigured
+    # emulator (e.g. QEMU too old for hwprobe) must fail loudly instead
+    # of degrading to a green-but-meaningless run. Without the variable
+    # it is print-only, so local ctest runs stay host-agnostic.
+    add_executable(rvcl_capability_assert tests/capability_assert.c)
+    target_link_libraries(rvcl_capability_assert PRIVATE rvcl)
+    add_test(NAME capability_assert COMMAND rvcl_capability_assert)
+
     add_executable(rvcl_smoke tests/smoke_test.c)
     target_link_libraries(rvcl_smoke PRIVATE rvcl)
     add_test(NAME smoke COMMAND rvcl_smoke)
