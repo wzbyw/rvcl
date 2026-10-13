@@ -19,14 +19,26 @@
  * Also covers the v0.1 acceptance criteria (PLAN §6.2):
  *   - scheduler injection does not change numeric results;
  *   - work-range partitioning covers without overlap or gap.
+ *
+ * Corpus mode: `rvcl_differential --batch=<file>` appends the shape
+ * corpus (tests/inputs/README.md, format spec) after the fixed contract
+ * sections below. Fixed sections test framework contracts, not shape
+ * numerics, and stay out of the batch loop by design. With no arguments
+ * the behavior is byte-for-byte the Phase 0 run.
+ *
+ * This file holds one of the two independent corpus parsers (bench has
+ * the other): both follow the spec's error table, and ctest runs the
+ * same corpus through both — cross-validation is the feature.
  ******************************************************************************/
 
 #include <math.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
 #include "rvcl/rvcl.h"
+#include "golden.h"
 #include "../src/backends/rvv/rvv_fp16.h"
 
 static int g_failures;
@@ -39,31 +51,6 @@ static int g_failures;
             g_failures++; \
         } \
     } while (0)
-
-/* ------------------------------------------------------- golden helpers */
-
-static void golden_f32(const float *a, const float *b, const float *bias,
-        float *c, int M, int N, int K) {
-    for (int i = 0; i < M; i++)
-        for (int j = 0; j < N; j++) {
-            float acc = bias ? bias[j] : 0.0f;
-            for (int p = 0; p < K; p++)
-                acc += a[i * K + p] * b[p * N + j];
-            c[i * N + j] = acc;
-        }
-}
-
-static void golden_f16(const uint16_t *a, const uint16_t *b, const float *bias,
-        float *c, int M, int N, int K) {
-    for (int i = 0; i < M; i++)
-        for (int j = 0; j < N; j++) {
-            float acc = bias ? bias[j] : 0.0f;
-            for (int p = 0; p < K; p++)
-                acc += rvv_f16_to_f32(a[i * K + p])
-                        * rvv_f16_to_f32(b[p * N + j]);
-            c[i * N + j] = acc;
-        }
-}
 
 /* ------------------------------------------------------ run-one-backend */
 
@@ -183,6 +170,378 @@ static rvcl_status_t run_named_kernel(const char *name,
     return run_named_kernel_range(name, d, a, b, bias, c, -1, -1);
 }
 
+/* ------------------------------------------------- corpus: parser (own)
+ *
+ * Independent implementation #1 of the tests/inputs format (bench has
+ * #2). Conformance contract: the error table in tests/inputs/README.md
+ * — same messages, same exit code 2.
+ *
+ * Header option key table: keys are operator-independent today; a new
+ * operator directory extends its own keys at this table without
+ * touching the grammar.
+ */
+
+typedef struct {
+    int64_t m, n, k;
+    char *label; /* effective label: n"…" or the normalized shape */
+} corpus_case_t;
+
+typedef struct {
+    corpus_case_t *cases;
+    int count, cap;
+    int dt_explicit;     /* 0 = run both dtypes */
+    rvcl_dtype_t dt;     /* valid when dt_explicit */
+} corpus_t;
+
+static const char *const g_corpus_header_keys[] = {"--mode", "--dt", NULL};
+
+static void corpus_fatal(const char *file, int line, const char *fmt, ...)
+        __attribute__((noreturn, format(printf, 3, 4)));
+
+static void corpus_fatal(const char *file, int line, const char *fmt, ...) {
+    va_list ap;
+    fprintf(stderr, "error: %s:%d: ", file, line);
+    va_start(ap, fmt);
+    vfprintf(stderr, fmt, ap);
+    va_end(ap);
+    fputc('\n', stderr);
+    exit(2);
+}
+
+/* parses one decimal int at *pp; advances *pp; fails fatally on bad
+ * syntax or range */
+static int64_t parse_dim(const char **pp, const char *file, int line,
+        const char *orig) {
+    const char *p = *pp;
+    if (*p < '0' || *p > '9')
+        corpus_fatal(file, line, "unparsable case '%s'", orig);
+    int64_t v = 0;
+    while (*p >= '0' && *p <= '9') {
+        v = v * 10 + (*p - '0');
+        if (v > 1000000000)
+            corpus_fatal(file, line, "dimension overflow in '%s'", orig);
+        p++;
+    }
+    if (v < 1 || v > 4096)
+        corpus_fatal(file, line,
+                "dimension %lld out of bounds 1..4096 in '%s'",
+                (long long)v, orig);
+    *pp = p;
+    return v;
+}
+
+/* parses `int x int x int`, advances *pp past it */
+static void parse_triple(const char **pp, int64_t t[3], const char *file,
+        int line, const char *orig) {
+    t[0] = parse_dim(pp, file, line, orig);
+    if (**pp != 'x') corpus_fatal(file, line, "unparsable case '%s'", orig);
+    (*pp)++;
+    t[1] = parse_dim(pp, file, line, orig);
+    if (**pp != 'x') corpus_fatal(file, line, "unparsable case '%s'", orig);
+    (*pp)++;
+    t[2] = parse_dim(pp, file, line, orig);
+}
+
+static void corpus_add(corpus_t *c, int64_t m, int64_t n, int64_t k,
+        char *label, const char *file, int line) {
+    /* label uniqueness (the point: unambiguous failure localization) */
+    for (int i = 0; i < c->count; i++)
+        if (strcmp(c->cases[i].label, label) == 0)
+            corpus_fatal(file, line, "duplicate label n\"%s\"", label);
+    if (c->count == c->cap) {
+        c->cap = c->cap ? c->cap * 2 : 64;
+        c->cases = realloc(c->cases, (size_t)c->cap * sizeof(*c->cases));
+        if (!c->cases) {
+            fprintf(stderr, "error: out of memory\n");
+            exit(2);
+        }
+    }
+    c->cases[c->count++] = (corpus_case_t){m, n, k, label};
+}
+
+static void parse_header(corpus_t *c, const char *text, const char *file,
+        int line) {
+    const char *eq = strchr(text, '=');
+    char key[32];
+    size_t klen = eq ? (size_t)(eq - text) : strlen(text);
+    if (klen >= sizeof(key)) klen = sizeof(key) - 1;
+    memcpy(key, text, klen);
+    key[klen] = '\0';
+
+    int known = 0;
+    for (int i = 0; g_corpus_header_keys[i]; i++)
+        if (!strcmp(key, g_corpus_header_keys[i])) known = 1;
+    if (!known)
+        corpus_fatal(file, line, "unknown header option '%s'", key);
+    if (!eq || !eq[1])
+        corpus_fatal(file, line, "header option '%s' needs a value", key);
+    const char *val = eq + 1;
+
+    if (!strcmp(key, "--mode")) {
+        if (strcmp(val, "C") && strcmp(val, "P") && strcmp(val, "S"))
+            corpus_fatal(file, line,
+                    "bad value for --mode: '%s' (want C, P or S)", val);
+        /* differential is inherently mode C: the value is validated and
+         * ignored — bench honors it */
+    } else { /* --dt */
+        if (!strcmp(val, "f32")) {
+            c->dt_explicit = 1;
+            c->dt = RVCL_DTYPE_FP32;
+        } else if (!strcmp(val, "f16")) {
+            c->dt_explicit = 1;
+            c->dt = RVCL_DTYPE_FP16;
+        } else {
+            corpus_fatal(file, line,
+                    "bad value for --dt: '%s' (want f32 or f16)", val);
+        }
+    }
+}
+
+static void parse_case(corpus_t *c, char *text, const char *file, int line) {
+    /* shape token: ends at whitespace, '_' (glued label) or EOL */
+    char *tok = text;
+    size_t tlen = strcspn(text, " \t_");
+    char saved = tok[tlen];
+    tok[tlen] = '\0';
+
+    const char *p = tok;
+    int64_t t1[3], m, n, k;
+    parse_triple(&p, t1, file, line, tok);
+    if (*p == ':') { /* double triple MxK:KxN — K values must match */
+        p++;
+        int64_t t2[3];
+        parse_triple(&p, t2, file, line, tok);
+        if (t1[2] != t2[1])
+            corpus_fatal(file, line,
+                    "K mismatch in double triple '%s': %lld vs %lld", tok,
+                    (long long)t1[2], (long long)t2[1]);
+        m = t1[1];
+        n = t2[2];
+        k = t1[2];
+    } else {
+        m = t1[0];
+        n = t1[1];
+        k = t1[2];
+    }
+    if (*p == '*') { /* occurrence count: tolerated and ignored */
+        p++;
+        if (*p < '0' || *p > '9')
+            corpus_fatal(file, line, "unparsable case '%s'", tok);
+        while (*p >= '0' && *p <= '9') p++;
+    }
+    if (*p != '\0')
+        corpus_fatal(file, line, "unparsable case '%s'", tok);
+
+    tok[tlen] = saved;
+
+    /* separator then optional label */
+    char *rest = text + tlen;
+    rest += strspn(rest, " \t_");
+    if (*rest == '\0' || *rest == '#') { /* no label: shape is the label */
+        char shape_s[64];
+        snprintf(shape_s, sizeof(shape_s), "%lldx%lldx%lld",
+                (long long)m, (long long)n, (long long)k);
+        corpus_add(c, m, n, k, strdup(shape_s), file, line);
+        return;
+    }
+    if (rest[0] != 'n' || rest[1] != '"')
+        corpus_fatal(file, line, "expected n\"label\" after shape in '%s'",
+                text);
+    char *name = rest + 2;
+    char *close = strchr(name, '"');
+    if (!close)
+        corpus_fatal(file, line, "unterminated label in '%s'", text);
+    for (const char *q = name; q < close; q++)
+        if (!( (*q >= 'A' && *q <= 'Z') || (*q >= 'a' && *q <= 'z')
+                    || (*q >= '0' && *q <= '9') || *q == '_' || *q == '.'
+                    || *q == '*' || *q == '-'))
+            corpus_fatal(file, line, "bad label character '%c' in '%s'",
+                    *q, text);
+    if (close == name)
+        corpus_fatal(file, line, "empty label in '%s'", text);
+    *close = '\0';
+    close++;
+    close += strspn(close, " \t");
+    if (*close != '\0' && *close != '#')
+        corpus_fatal(file, line, "trailing junk after label in '%s'", text);
+
+    corpus_add(c, m, n, k, strdup(name), file, line);
+}
+
+static void parse_corpus(const char *path, corpus_t *c) {
+    memset(c, 0, sizeof(*c));
+    FILE *f = fopen(path, "r");
+    if (!f) {
+        fprintf(stderr, "error: cannot open corpus '%s'\n", path);
+        exit(2);
+    }
+
+    char *line = NULL;
+    size_t cap = 0;
+    ssize_t len;
+    int lineno = 0, seen_case = 0;
+    while ((len = getline(&line, &cap, f)) != -1) {
+        lineno++;
+        while (len > 0 && (line[len - 1] == '\n' || line[len - 1] == '\r'))
+            line[--len] = '\0';
+        char *p = line + strspn(line, " \t");
+        if (*p == '\0' || *p == '#') continue;
+        if (!strncmp(p, "--", 2)) {
+            if (seen_case)
+                corpus_fatal(path, lineno,
+                        "header option after first case: '%s'", p);
+            /* trim trailing comment/blank off the option line */
+            char *e = strpbrk(p, " \t#");
+            if (e) *e = '\0';
+            parse_header(c, p, path, lineno);
+            continue;
+        }
+        seen_case = 1;
+        parse_case(c, p, path, lineno);
+    }
+    free(line);
+    fclose(f);
+
+    if (c->count == 0)
+        corpus_fatal(path, lineno, "empty corpus (no case lines)");
+}
+
+/* -------------------------------------------------- corpus: run one case
+ *
+ * Runs every capability-legal registered kernel for the dtype through
+ * the factory bypass and compares against the shared golden. Returns
+ * 0 = ok, 1 = failure, -1 = skip (no legal kernel, dtype defaulted).
+ */
+
+#define CORPUS_MAX_KERNELS 8
+
+static int legal_kernels_for(rvcl_dtype_t dt,
+        const char *names[CORPUS_MAX_KERNELS]) {
+    const rvcl_capability_t *cap = rvcl_get_capability();
+    int nk = 0;
+    for (int i = 0; i < rvcl_registry_count(); i++) {
+        const rvcl_kernel_desc_t *kd = rvcl_registry_get(i);
+        if (!kd || kd->operation != RVCL_OP_MATMUL) continue;
+        if (kd->dtype_a != dt) continue;
+        int legal = 1;
+        for (int f = 0; f < kd->num_required_features; f++)
+            if (!rvcl_capability_has(cap, kd->required_features[f]))
+                legal = 0;
+        if (legal && nk < CORPUS_MAX_KERNELS) names[nk++] = kd->name;
+    }
+    return nk;
+}
+
+static int run_case(const corpus_case_t *cc, rvcl_dtype_t dt,
+        int dt_explicit) {
+    const char *names[CORPUS_MAX_KERNELS];
+    const int nk = legal_kernels_for(dt, names);
+    const char *dtstr = dt == RVCL_DTYPE_FP32 ? "f32" : "f16";
+    char shape_s[64];
+    snprintf(shape_s, sizeof(shape_s), "%lldx%lldx%lld",
+            (long long)cc->m, (long long)cc->n, (long long)cc->k);
+
+    if (nk == 0) {
+        if (dt_explicit) {
+            printf("FAIL %s (%s, %s): no kernel registered for %s\n",
+                    cc->label, shape_s, dtstr, dtstr);
+            return 1;
+        }
+        printf("skip: %s (no %s kernel on this host)\n", cc->label, dtstr);
+        return -1;
+    }
+
+    const int64_t elems = cc->m * cc->n;
+    const uint32_t seed = golden_case_seed(cc->m, cc->n, cc->k);
+    float *golden = malloc((size_t)elems * 4);
+    float *c = malloc((size_t)elems * 4);
+    int fails = 0;
+
+    rvcl_matmul_desc_t d = {
+        .m = cc->m, .n = cc->n, .k = cc->k,
+        .dtype_acc = RVCL_DTYPE_AUTO,
+        .dtype_c = RVCL_DTYPE_FP32,
+        .dtype_bias = RVCL_DTYPE_FP32,
+    };
+    float *bias = malloc((size_t)cc->n * 4);
+    lcg_fill_f32(bias, (size_t)cc->n, seed ^ 0x85ebca6bu);
+
+    if (dt == RVCL_DTYPE_FP32) {
+        d.dtype_a = d.dtype_b = RVCL_DTYPE_FP32;
+        float *a = malloc((size_t)(cc->m * cc->k) * 4);
+        float *b = malloc((size_t)(cc->k * cc->n) * 4);
+        lcg_fill_f32(a, (size_t)(cc->m * cc->k), seed);
+        lcg_fill_f32(b, (size_t)(cc->k * cc->n), seed ^ 0x9e3779b9u);
+        golden_f32(a, b, bias, golden, cc->m, cc->n, cc->k);
+
+        for (int i = 0; i < nk; i++) {
+            golden_sentinel(c, (size_t)elems * 4);
+            rvcl_status_t st = run_named_kernel(names[i], &d, a, b, bias, c);
+            if (st != RVCL_SUCCESS) {
+                printf("FAIL %s (%s, %s): kernel %s run status %d\n",
+                        cc->label, shape_s, dtstr, names[i], (int)st);
+                fails++;
+                continue;
+            }
+            golden_cmp_t r = golden_cmp_bitexact(c, golden, elems);
+            if (r.mismatches == 0) {
+                printf("  ok: %s (%s, %s) %s\n", cc->label, shape_s, dtstr,
+                        names[i]);
+            } else {
+                printf("FAIL %s (%s, %s): %s: first mismatch at "
+                       "(i=%lld,j=%lld) exp=%g got=%g (%lld mismatch)\n",
+                        cc->label, shape_s, dtstr, names[i],
+                        (long long)(r.first / cc->n),
+                        (long long)(r.first % cc->n),
+                        r.exp_first, r.got_first,
+                        (long long)r.mismatches);
+                fails++;
+            }
+        }
+        free(a);
+        free(b);
+    } else {
+        d.dtype_a = d.dtype_b = RVCL_DTYPE_FP16;
+        uint16_t *ah = malloc((size_t)(cc->m * cc->k) * 2);
+        uint16_t *bh = malloc((size_t)(cc->k * cc->n) * 2);
+        lcg_fill_f16(ah, (size_t)(cc->m * cc->k), seed);
+        lcg_fill_f16(bh, (size_t)(cc->k * cc->n), seed ^ 0x9e3779b9u);
+        golden_f16(ah, bh, bias, golden, cc->m, cc->n, cc->k);
+
+        for (int i = 0; i < nk; i++) {
+            golden_sentinel(c, (size_t)elems * 4);
+            rvcl_status_t st = run_named_kernel(names[i], &d, ah, bh, bias, c);
+            if (st != RVCL_SUCCESS) {
+                printf("FAIL %s (%s, %s): kernel %s run status %d\n",
+                        cc->label, shape_s, dtstr, names[i], (int)st);
+                fails++;
+                continue;
+            }
+            golden_cmp_t r = golden_cmp_tol(c, golden, elems, 1e-3f);
+            if (r.mismatches == 0) {
+                printf("  ok: %s (%s, %s) %s\n", cc->label, shape_s, dtstr,
+                        names[i]);
+            } else {
+                printf("FAIL %s (%s, %s): %s: first mismatch at "
+                       "(i=%lld,j=%lld) exp=%g got=%g (%lld mismatch)\n",
+                        cc->label, shape_s, dtstr, names[i],
+                        (long long)(r.first / cc->n),
+                        (long long)(r.first % cc->n),
+                        r.exp_first, r.got_first,
+                        (long long)r.mismatches);
+                fails++;
+            }
+        }
+        free(ah);
+        free(bh);
+    }
+
+    free(bias);
+    free(golden);
+    free(c);
+    return fails ? 1 : 0;
+}
+
 /* -------------------------------------------------- scheduler test rig */
 
 /* A scheduler that splits M into 4 slices and runs them serially in this
@@ -217,7 +576,17 @@ static void recording_parallel_for(rvcl_ischeduler_t *s,
 
 /* --------------------------------------------------------------- main */
 
-int main(void) {
+int main(int argc, char **argv) {
+    const char *batch = NULL;
+    for (int i = 1; i < argc; i++) {
+        if (!strncmp(argv[i], "--batch=", 8) && argv[i][8])
+            batch = argv[i] + 8;
+        else {
+            fprintf(stderr, "usage: %s [--batch=<corpus-file>]\n", argv[0]);
+            return 2;
+        }
+    }
+
     CHECK(rvcl_init() == RVCL_SUCCESS, "rvcl_init succeeds");
 
     CHECK(rvcl_registry_find_factory("rvcl_matmul_f32_reference") != NULL,
@@ -385,8 +754,43 @@ int main(void) {
 
     free(a); free(b); free(bias); free(c_ref); free(c_rvv); free(golden);
     free(ah); free(bh);
-    printf(g_failures ? "DIFFERENTIAL: %d failure(s)\n"
-                      : "DIFFERENTIAL: all passed\n",
-            g_failures);
-    return g_failures ? 1 : 0;
+
+    /* ---- corpus batch (shape numerics; contract cases stay above) ---- */
+    int batch_fail = 0;
+    if (batch) {
+        corpus_t corpus;
+        parse_corpus(batch, &corpus);
+
+        int ok = 0, fail = 0, skip = 0, fi = 0;
+        const rvcl_dtype_t dts[2] = {RVCL_DTYPE_FP32, RVCL_DTYPE_FP16};
+        const char **failed_labels = calloc((size_t)corpus.count * 2,
+                sizeof(*failed_labels));
+        for (int i = 0; i < corpus.count; i++) {
+            for (int dti = 0; dti < 2; dti++) {
+                if (corpus.dt_explicit && corpus.dt != dts[dti]) continue;
+                int rc = run_case(&corpus.cases[i], dts[dti],
+                        corpus.dt_explicit);
+                if (rc < 0) skip++;
+                else if (rc > 0) {
+                    fail++;
+                    failed_labels[fi++] = corpus.cases[i].label;
+                } else ok++;
+            }
+        }
+        printf("CASES: %d ok, %d fail, %d skip\n", ok, fail, skip);
+        if (fail) {
+            printf("failed:");
+            for (int i = 0; i < fi; i++) printf(" %s", failed_labels[i]);
+            printf("\n");
+        }
+        batch_fail = fail;
+        for (int i = 0; i < corpus.count; i++) free(corpus.cases[i].label);
+        free(corpus.cases);
+        free(failed_labels);
+    }
+
+    printf(g_failures || batch_fail ? "DIFFERENTIAL: %d failure(s)\n"
+                                    : "DIFFERENTIAL: all passed\n",
+            g_failures + batch_fail);
+    return (g_failures || batch_fail) ? 1 : 0;
 }

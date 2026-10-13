@@ -95,4 +95,13 @@ typedef void (*rvv_gemm_fn)(const void *a, const void *b_packed,
         const void *bias, void *c, int64_t m, int64_t n, int64_t k_dim,
         const rvcl_work_range_t *r);
 
+/* Micro-kernel selection — single source of truth for "which kernel is
+ * live" per dtype: the backend create_f32/f16 binding and the bench
+ * kernel-only metric both call these, so what dispatch runs and what
+ * the bench measures can never drift apart. v0.1 T5 inserts the JIT
+ * option here (three-path selection). Internal to the backend/tests;
+ * not public API. */
+rvv_gemm_fn rvv_pick_gemm_f32(void);
+rvv_gemm_fn rvv_pick_gemm_f16(void);
+
 #endif /* RVCL_RVV_INTERNAL_H */

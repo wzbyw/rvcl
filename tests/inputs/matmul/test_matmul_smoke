@@ -1,0 +1,8 @@
+# matmul smoke — PR gate: ragged + panel edge + degenerate
+33x19x47 n"ragged_panel_edge"
+64x8x64 n"panel_n_exact"
+64x9x64 n"panel_n_plus_one"
+64x7x64 n"panel_n_minus_one"
+1x19x47 n"degenerate_m1"
+33x1x47 n"degenerate_n1"
+33x19x1 n"degenerate_k1"

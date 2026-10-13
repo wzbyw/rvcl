@@ -109,6 +109,13 @@ endif()
 #   cmake -DRVCL_ENABLE_RVV=ON -DRVCL_ENABLE_IME=OFF ...
 
 # ------------------------------------------------------------------- tests
+# Shared golden helpers: the single data-semantics point for the test
+# executables (differential + bench C mode). Corpus parsers stay
+# deliberately double-implemented — cross-validation is the feature.
+if(RVCL_BUILD_TESTS OR RVCL_BUILD_BENCH)
+    add_library(rvcl_test_golden STATIC tests/golden.c)
+endif()
+
 if(RVCL_BUILD_TESTS)
     enable_testing()
     add_executable(rvcl_smoke tests/smoke_test.c)
@@ -116,26 +123,56 @@ if(RVCL_BUILD_TESTS)
     add_test(NAME smoke COMMAND rvcl_smoke)
 
     add_executable(rvcl_differential tests/differential_test.c)
-    target_link_libraries(rvcl_differential PRIVATE rvcl m)
+    target_link_libraries(rvcl_differential PRIVATE rvcl m rvcl_test_golden)
     add_test(NAME differential COMMAND rvcl_differential)
+
+    # Corpus registration: one line per corpus file -> one modeC ctest
+    # target running the differential (the assertion engine) over it.
+    # RVCL_TEST_SET picks the tier at configure time (smoke < ci < all,
+    # default smoke — fast local builds; CI raises it explicitly);
+    # run-time LABELS allow `ctest -L corpus|smoke|ci` selection. The <op>
+    # parameter is the multi-operator landing point: a new operator
+    # directory registers the same way.
+    set(RVCL_TEST_SET "smoke" CACHE STRING
+        "Corpus tier registered as ctest targets: smoke | ci | all")
+    if(NOT RVCL_TEST_SET MATCHES "^(smoke|ci|all)$")
+        message(FATAL_ERROR "RVCL_TEST_SET must be smoke, ci or all")
+    endif()
+    function(rvcl_add_corpus op set file)
+        if(RVCL_TEST_SET STREQUAL "all"
+                OR (RVCL_TEST_SET STREQUAL "ci" AND NOT "${set}" STREQUAL "weekly")
+                OR (RVCL_TEST_SET STREQUAL "smoke" AND "${set}" STREQUAL "smoke"))
+            add_test(NAME test_${op}_modeC_${set}
+                COMMAND rvcl_differential
+                        --batch=${CMAKE_CURRENT_SOURCE_DIR}/tests/inputs/${op}/${file})
+            set_tests_properties(test_${op}_modeC_${set}
+                PROPERTIES LABELS "corpus;${set}")
+        endif()
+    endfunction()
+
+    rvcl_add_corpus(matmul smoke test_matmul_smoke)
+    rvcl_add_corpus(matmul ci    test_matmul_ci)
 endif()
 
 # ---------------------------------------------------------------- examples
 if(RVCL_BUILD_EXAMPLES)
     add_executable(example_matmul examples/matmul.c)
     target_link_libraries(example_matmul PRIVATE rvcl)
+    add_test(NAME example_matmul COMMAND example_matmul)
 
     add_executable(example_dispatch examples/dispatch.c)
     target_link_libraries(example_dispatch PRIVATE rvcl)
+    add_test(NAME example_dispatch COMMAND example_dispatch)
 
     add_executable(example_scheduler examples/scheduler.c)
     target_link_libraries(example_scheduler PRIVATE rvcl)
+    add_test(NAME example_scheduler COMMAND example_scheduler)
 endif()
 
 # -------------------------------------------------------------------- bench
 if(RVCL_BUILD_BENCH)
     add_executable(rvcl_bench tests/bench_matmul.c)
-    target_link_libraries(rvcl_bench PRIVATE rvcl m)
+    target_link_libraries(rvcl_bench PRIVATE rvcl m rvcl_test_golden)
 endif()
 
 # ------------------------------------------------------------------ install
