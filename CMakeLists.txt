@@ -13,6 +13,13 @@ option(RVCL_ENABLE_AME   "Enable AME backend"        OFF) # lands in v0.3
 option(RVCL_BUILD_TESTS  "Build tests"               ON)
 option(RVCL_BUILD_EXAMPLES "Build examples"          ON)
 option(RVCL_BUILD_BENCH  "Build benchmark harness"   ON)
+option(RVCL_ENABLE_WERROR "Treat compiler warnings as errors" OFF)
+
+# The rvcl target always carries -Wall -Wextra; this gate extends the same
+# bar to tests/examples/bench and makes any warning fatal.
+if(RVCL_ENABLE_WERROR)
+    add_compile_options(-Wall -Wextra -Werror)
+endif()
 
 # The reference backend is always built: golden path + host-agnostic CI.
 set(RVCL_ENABLE_REFERENCE ON)
