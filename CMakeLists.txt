@@ -111,6 +111,16 @@ target_compile_definitions(rvcl PRIVATE RVCL_BUILDING)
 
 if(RVCL_ENABLE_RVV)
     target_compile_definitions(rvcl PRIVATE RVCL_ENABLE_RVV_BUILD)
+    # Enabled VLEN tiers (comma list): each tier t defines RVCL_RVV_TIERS_t,
+    # which the RVV backend uses to register one dedicated descriptor per
+    # tier. The set decides which per-tier registry entries exist in a
+    # build; the intrinsics implementation is shared across tiers for now.
+    set(RVCL_RVV_TIERS "128,256,512,1024" CACHE STRING
+        "Enabled RVV VLEN tiers (comma list of 128/256/512/1024)")
+    string(REPLACE "," ";" _rvcl_tiers "${RVCL_RVV_TIERS}")
+    foreach(_t IN LISTS _rvcl_tiers)
+        target_compile_definitions(rvcl PRIVATE RVCL_RVV_TIERS_${_t})
+    endforeach()
 endif()
 
 # On real RVV targets ensure the vector extension is enabled in -march.
@@ -199,6 +209,13 @@ if(RVCL_BUILD_TESTS)
     add_executable(rvcl_differential tests/differential_test.cpp)
     target_link_libraries(rvcl_differential PRIVATE rvcl m rvcl_test_golden)
     add_test(NAME differential COMMAND rvcl_differential)
+
+    # Registry unit tests (always registered, independent of RVCL_TEST_SET):
+    # registration/unregistration contracts, validation, fallback
+    # invariant, registration order and concurrent access safety.
+    add_executable(rvcl_unit_registry tests/unit_registry.cpp)
+    target_link_libraries(rvcl_unit_registry PRIVATE rvcl rvcl_test_golden)
+    add_test(NAME unit_registry COMMAND rvcl_unit_registry)
 
     # Corpus registration: one line per corpus file -> one modeC ctest
     # target running the differential (the assertion engine) over it.
