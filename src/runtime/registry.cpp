@@ -19,13 +19,13 @@
  *
  * Stable-slot storage with an ordered index (RFC-0002 registry):
  *   - descriptors live in fixed slots that are never moved by unregister,
- *     so pointers handed out by rvcl_registry_get() stay valid until the
- *     corresponding kernel is unregistered (concurrent iteration during
- *     unregister reads coherent descriptor content);
+ *     so a pointer handed out by rvcl_registry_get() stays valid while
+ *     the kernel it refers to is registered;
  *   - g_order keeps the registration sequence; dispatch relies on it as
  *     the deterministic tie-break between equal-cost candidates;
- *   - freed slots are reused only after all never-used slots are spent,
- *     which keeps the reuse window away from realistic reader patterns.
+ *   - freed slots are reused only after all never-used slots are spent.
+ *     A pointer to an unregistered kernel therefore must not be used: its
+ *     slot may later hold a different descriptor.
  *
  * Registrations are fully validated before any state changes (reject
  * atomically, never partially register). Unregistering the last unbounded
@@ -36,10 +36,10 @@
 
 #include "rvcl/registry.h"
 
+#include "registry_internal.h"
 #include "rvcl/dispatch.h"
 
 #include <pthread.h>
-#include <stdio.h>
 #include <string.h>
 
 typedef struct {
@@ -155,6 +155,20 @@ static int desc_is_unbounded(const rvcl_kernel_desc_t *d) {
     return d->max_m == 0 && d->max_n == 0 && d->max_k == 0;
 }
 
+/* Does the datatype tuple `d` belongs to contain at least one unbounded
+ * kernel? Every live tuple must (FR1.7). */
+static int tuple_has_unbounded_locked(const rvcl_kernel_desc_t *d) {
+    for (int i = 0; i < g_count; i++) {
+        const rvcl_kernel_desc_t *o = &g_slots[g_order[i]].desc;
+        if (o->operation != d->operation || o->dtype_a != d->dtype_a
+                || o->dtype_b != d->dtype_b || o->dtype_acc != d->dtype_acc
+                || o->dtype_c != d->dtype_c)
+            continue;
+        if (desc_is_unbounded(o)) return 1;
+    }
+    return 0;
+}
+
 /* Would removing `skip` leave its datatype tuple without an unbounded
  * fallback? Only meaningful when other entries of the tuple remain. */
 static int tuple_keeps_fallback_locked(int skip) {
@@ -219,10 +233,15 @@ rvcl_status_t rvcl_unregister_kernel(const char *name) {
         return RVCL_ERROR_REGISTRY_INVARIANT;
     }
     /* Remove from the order index; descriptor storage stays in place so
-     * pointers held by concurrent readers remain coherent. */
+     * pointers to the remaining entries stay coherent. Pointers to the
+     * removed kernel become invalid (see registry.h). */
     int pos = 0;
-    while (g_order[pos] != s)
+    while (pos < g_count && g_order[pos] != s)
         pos++;
+    if (pos == g_count) { /* found by name but missing from the order index */
+        pthread_mutex_unlock(&g_mutex);
+        return RVCL_ERROR_INTERNAL;
+    }
     memmove(&g_order[pos], &g_order[pos + 1],
             (size_t)(g_count - pos - 1) * sizeof(int));
     g_count--;
@@ -249,6 +268,7 @@ const rvcl_kernel_desc_t *rvcl_registry_get(int index) {
 }
 
 rvcl_kernel_create_fn rvcl_registry_find_factory(const char *name) {
+    if (!name) return NULL;
     rvcl_kernel_create_fn fn = NULL;
     pthread_mutex_lock(&g_mutex);
     const int s = find_slot_locked(name);
@@ -260,16 +280,35 @@ rvcl_kernel_create_fn rvcl_registry_find_factory(const char *name) {
 /* ------------------------------------------------------------ invariant */
 
 /* Whole-table fallback check, run once initialization finished (internal
- * symbol, not public API; declared in init.cpp). */
+ * symbol, not public API; declared in registry_internal.h). */
 rvcl_status_t rvcl_registry_verify_fallback_invariant(void) {
     pthread_mutex_lock(&g_mutex);
     for (int i = 0; i < g_count; i++) {
-        const int s = g_order[i];
-        if (!tuple_keeps_fallback_locked(s)) {
+        const rvcl_kernel_desc_t *d = &g_slots[g_order[i]].desc;
+        if (!tuple_has_unbounded_locked(d)) {
             pthread_mutex_unlock(&g_mutex);
             return RVCL_ERROR_REGISTRY_INVARIANT;
         }
     }
     pthread_mutex_unlock(&g_mutex);
+    return RVCL_SUCCESS;
+}
+
+/* Init-path rollback: drop the tail of the registration order, leaving
+ * the first `count` entries untouched. */
+rvcl_status_t rvcl_registry_rollback(int count) {
+    pthread_mutex_lock(&g_mutex);
+    if (count < 0 || count > g_count) {
+        pthread_mutex_unlock(&g_mutex);
+        return RVCL_ERROR_INTERNAL;
+    }
+    while (g_count > count) {
+        const int s = g_order[g_count - 1];
+        g_slots[s].used = 0;
+        g_count--;
+    }
+    pthread_mutex_unlock(&g_mutex);
+
+    rvcl_dispatch_cache_clear();
     return RVCL_SUCCESS;
 }

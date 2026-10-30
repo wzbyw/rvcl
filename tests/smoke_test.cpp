@@ -130,16 +130,24 @@ int main(void) {
      * matmul entry, and on a vector build with RVV capability present it
      * comes from the rvv family. */
     const char *sel = r ? rvcl_dispatch_kernel_name(r) : NULL;
-    CHECK(sel && strncmp(sel, "rvcl_matmul_f32_r", 17) == 0,
-            "selected kernel is a registered f32 matmul entry");
-    const int vector_build
-            = rvcl_registry_find_factory("rvcl_matmul_f32_rvv") != NULL;
-    const int host_has_rvv = rvcl_capability_has(cap, RVCL_FEATURE_RVV);
-    if (vector_build && host_has_rvv)
-        CHECK(strncmp(sel, "rvcl_matmul_f32_rvv", 19) == 0,
-                "vector build with RVV host selects an rvv-family kernel");
-    CHECK(rvcl_registry_find_factory(sel) != NULL,
-            "selected name resolves in the registry");
+    CHECK(sel != NULL, "dispatch returned a kernel name");
+    if (sel) {
+        CHECK(strncmp(sel, "rvcl_matmul_f32_r", 17) == 0,
+                "selected kernel is a registered f32 matmul entry");
+        const int vector_build
+                = rvcl_registry_find_factory("rvcl_matmul_f32_rvv") != NULL;
+        const int host_has_rvv = rvcl_capability_has(cap, RVCL_FEATURE_RVV);
+        if (vector_build && host_has_rvv)
+            CHECK(strncmp(sel, "rvcl_matmul_f32_rvv", 19) == 0,
+                    "vector build with RVV host selects an rvv-family kernel");
+        /* Interim selection: the legacy static priority ranks the portable
+         * `_rvv_c` entry above `reference` on hosts without RVV. The
+         * dispatch rework replaces that priority with registration order,
+         * after which those hosts select `reference`; the prefix assertion
+         * above holds in both phases. */
+        CHECK(rvcl_registry_find_factory(sel) != NULL,
+                "selected name resolves in the registry");
+    }
     int num_ws = -1;
     rvcl_dispatch_ws_req(r, &num_ws);
     CHECK(num_ws >= 0 && num_ws <= RVCL_MAX_WORKSPACES,

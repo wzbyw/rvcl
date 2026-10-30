@@ -441,7 +441,9 @@ static void parse_corpus(const char *path, corpus_t *c) {
  * 0 = ok, 1 = failure, -1 = skip (no legal kernel, dtype defaulted).
  */
 
-#define CORPUS_MAX_KERNELS 16
+/* Covers every kernel legal for one dtype with headroom; growth beyond
+ * this fails loudly instead of silently dropping corpus coverage. */
+#define CORPUS_MAX_KERNELS 8
 
 static int legal_kernels_for(
         rvcl_dtype_t dt, const char *names[CORPUS_MAX_KERNELS]) {
@@ -462,6 +464,7 @@ static int legal_kernels_for(
                     "corpus: more than %d legal kernels for the dtype, "
                     "raise CORPUS_MAX_KERNELS\n",
                     CORPUS_MAX_KERNELS);
+            /* exit(2) = corpus/usage error, as used by the parser paths. */
             exit(2);
         }
         names[nk++] = kd->name;

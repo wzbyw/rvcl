@@ -109,8 +109,6 @@ typedef struct {
     rvcl_kernel_cost_fn cost_fn;
 } rvcl_kernel_desc_t;
 
-/* ------------------------------------------------------------ cost model */
-
 /* ------------------------------------------------------- operation descs */
 
 /* Quantization context (PLAN §4.5.3); zero-init for non-quantized paths. */

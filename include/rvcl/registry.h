@@ -65,10 +65,10 @@ RVCL_API int rvcl_registry_count(void);
 
 /*
  * Iteration in registration order: returns NULL when index out of range.
- * The returned pointer stays valid until the kernel it refers to is
- * unregistered (descriptor storage never moves); contents remain intact
- * after unregistration, but reuse of the storage by a later registration
- * is unspecified.
+ * The returned pointer is valid only while the kernel it refers to is
+ * registered. Unregistration never moves descriptor storage, but the
+ * freed slot may be reused by a later registration, so a pointer must
+ * not be dereferenced after its kernel has been unregistered.
  */
 RVCL_API const rvcl_kernel_desc_t *rvcl_registry_get(int index);
 

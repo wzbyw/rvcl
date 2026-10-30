@@ -31,6 +31,8 @@
 #include "rvcl/registry.h"
 #include "rvcl/types.h"
 
+#include "registry_internal.h"
+
 #include <atomic>
 #include <pthread.h>
 
@@ -43,9 +45,6 @@ rvcl_status_t rvcl_rvv_register(void);
  * compilation; no-op on vector builds. */
 rvcl_status_t rvcl_rvv_register_portable(void);
 /* ime/vme/ame backends: experimental, land in v0.2/v0.3 */
-
-/* Whole-table fallback invariant check (registry.cpp, internal). */
-rvcl_status_t rvcl_registry_verify_fallback_invariant(void);
 
 /* Registration failures propagate: a partially registered backend set
  * must not hide behind a successful init. */
@@ -87,15 +86,22 @@ RVCL_API rvcl_status_t rvcl_init(void) {
 
     pthread_mutex_lock(&g_init_mutex);
     if (!std::atomic_load_explicit(&g_initialized, std::memory_order_relaxed)) {
-        const rvcl_status_t st = register_all();
+        /* A failed attempt must leave the table exactly as it found it:
+         * entries registered before init (application kernels) stay, and
+         * a later rvcl_init() retry starts from the same state instead
+         * of failing forever on its own half-registered built-ins. The
+         * contract assumes application registration is not concurrent
+         * with the first init. */
+        const int before = rvcl_registry_count();
+        rvcl_status_t st = register_all();
+        if (st == RVCL_SUCCESS) {
+            const rvcl_status_t inv = rvcl_registry_verify_fallback_invariant();
+            if (inv != RVCL_SUCCESS) st = RVCL_ERROR_INTERNAL;
+        }
         if (st != RVCL_SUCCESS) {
+            rvcl_registry_rollback(before);
             pthread_mutex_unlock(&g_init_mutex);
             return st;
-        }
-        const rvcl_status_t inv = rvcl_registry_verify_fallback_invariant();
-        if (inv != RVCL_SUCCESS) {
-            pthread_mutex_unlock(&g_init_mutex);
-            return RVCL_ERROR_INTERNAL;
         }
         std::atomic_store_explicit(
                 &g_initialized, 1, std::memory_order_release);

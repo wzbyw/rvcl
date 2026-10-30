@@ -15,6 +15,35 @@ option(RVCL_BUILD_EXAMPLES "Build examples"          ON)
 option(RVCL_BUILD_BENCH  "Build benchmark harness"   ON)
 option(RVCL_ENABLE_WERROR "Treat compiler warnings as errors" OFF)
 
+# Enabled RVV VLEN tiers (comma list of 128/256/512/1024). Each tier t
+# defines RVCL_RVV_TIERS_t, which the RVV backend turns into one dedicated
+# registry descriptor. Declared here rather than under RVCL_ENABLE_RVV so
+# the option stays visible in every configuration; a typo must fail the
+# configure step instead of silently shipping a build with missing tiers.
+set(RVCL_RVV_TIERS "128,256,512,1024" CACHE STRING
+    "Enabled RVV VLEN tiers (comma list of 128/256/512/1024)")
+if(RVCL_RVV_TIERS STREQUAL "" OR RVCL_RVV_TIERS MATCHES "(^,|,,|,$)")
+    message(FATAL_ERROR "RVCL_RVV_TIERS: empty list or empty element")
+endif()
+string(REPLACE "," ";" _rvcl_tiers "${RVCL_RVV_TIERS}")
+set(_rvcl_tiers_seen)
+foreach(_t IN LISTS _rvcl_tiers)
+    if(NOT _t MATCHES "^(128|256|512|1024)$")
+        message(FATAL_ERROR
+            "RVCL_RVV_TIERS: '${_t}' is not one of 128/256/512/1024")
+    endif()
+    if(_t IN_LIST _rvcl_tiers_seen)
+        message(FATAL_ERROR "RVCL_RVV_TIERS: duplicate tier '${_t}'")
+    endif()
+    list(APPEND _rvcl_tiers_seen "${_t}")
+endforeach()
+# Canonical high-to-low order, independent of the user's spelling.
+list(SORT _rvcl_tiers COMPARE NATURAL ORDER DESCENDING)
+set(_rvcl_tier_defs)
+foreach(_t IN LISTS _rvcl_tiers)
+    list(APPEND _rvcl_tier_defs "RVCL_RVV_TIERS_${_t}")
+endforeach()
+
 # Comma-separated sanitizer list, e.g. "address,undefined". Adds the
 # corresponding -fsanitize flags for both compile and link so every target
 # (library, tests, examples, bench) is instrumented. -fno-omit-frame-pointer
@@ -111,16 +140,9 @@ target_compile_definitions(rvcl PRIVATE RVCL_BUILDING)
 
 if(RVCL_ENABLE_RVV)
     target_compile_definitions(rvcl PRIVATE RVCL_ENABLE_RVV_BUILD)
-    # Enabled VLEN tiers (comma list): each tier t defines RVCL_RVV_TIERS_t,
-    # which the RVV backend uses to register one dedicated descriptor per
-    # tier. The set decides which per-tier registry entries exist in a
-    # build; the intrinsics implementation is shared across tiers for now.
-    set(RVCL_RVV_TIERS "128,256,512,1024" CACHE STRING
-        "Enabled RVV VLEN tiers (comma list of 128/256/512/1024)")
-    string(REPLACE "," ";" _rvcl_tiers "${RVCL_RVV_TIERS}")
-    foreach(_t IN LISTS _rvcl_tiers)
-        target_compile_definitions(rvcl PRIVATE RVCL_RVV_TIERS_${_t})
-    endforeach()
+    # One dedicated descriptor per enabled tier; the intrinsics
+    # implementation is shared across tiers for now (A-07).
+    target_compile_definitions(rvcl PRIVATE ${_rvcl_tier_defs})
 endif()
 
 # On real RVV targets ensure the vector extension is enabled in -march.
@@ -215,7 +237,20 @@ if(RVCL_BUILD_TESTS)
     # invariant, registration order and concurrent access safety.
     add_executable(rvcl_unit_registry tests/unit_registry.cpp)
     target_link_libraries(rvcl_unit_registry PRIVATE rvcl rvcl_test_golden)
+    # The build configuration decides the enabled tier set (AC1), so the
+    # test must see the same RVCL_RVV_TIERS_<T> definitions as the library.
+    if(RVCL_ENABLE_RVV)
+        target_compile_definitions(rvcl_unit_registry PRIVATE ${_rvcl_tier_defs})
+    endif()
     add_test(NAME unit_registry COMMAND rvcl_unit_registry)
+    # Fresh-process init-path regressions: the whole-table fallback check
+    # must accept a legal bounded+unbounded pair registered before the
+    # first init and reject a lone bounded tuple, and a failed init must
+    # restore the pre-init registry.
+    add_test(NAME unit_registry_preinit_fallback
+        COMMAND rvcl_unit_registry --preinit-fallback)
+    add_test(NAME unit_registry_preinit_lone_bounded
+        COMMAND rvcl_unit_registry --preinit-lone-bounded)
 
     # Corpus registration: one line per corpus file -> one modeC ctest
     # target running the differential (the assertion engine) over it.

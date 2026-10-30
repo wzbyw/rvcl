@@ -26,12 +26,19 @@
  * Custom kernels use datatype tuples no builtin occupies (INT8/INT4) and
  * are unregistered again at the end of each case, followed by a dispatch
  * cache clear, so cases stay independent.
+ *
+ * Pre-init cases run in fresh processes (argv modes): they register
+ * custom kernels before the first rvcl_init() to exercise the whole-table
+ * fallback verifier and the failed-init rollback.
  ******************************************************************************/
 
 #include <pthread.h>
+#include <sched.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+#include <atomic>
 
 #include "golden.hpp"
 #include "rvcl/rvcl.h"
@@ -136,6 +143,80 @@ static int find_name_index(const char *name) {
 
 static int vector_build(void) {
     return rvcl_registry_find_factory("rvcl_matmul_f32_rvv") != NULL;
+}
+
+static int has_feature(const rvcl_kernel_desc_t *kd, rvcl_feature_id_t id) {
+    for (int i = 0; i < kd->num_required_features; i++)
+        if (kd->required_features[i] == id) return 1;
+    return 0;
+}
+
+/* Field-wise comparison for the concurrency final-state check (names are
+ * matched by lookup, not compared here). */
+static int same_desc(const rvcl_kernel_desc_t *a, const rvcl_kernel_desc_t *b) {
+    if (a->operation != b->operation || a->dtype_a != b->dtype_a
+            || a->dtype_b != b->dtype_b || a->dtype_acc != b->dtype_acc
+            || a->dtype_c != b->dtype_c || a->quant_support != b->quant_support
+            || a->num_required_features != b->num_required_features
+            || a->min_m != b->min_m || a->max_m != b->max_m
+            || a->min_n != b->min_n || a->max_n != b->max_n
+            || a->min_k != b->min_k || a->max_k != b->max_k
+            || a->alignment_a != b->alignment_a
+            || a->alignment_b != b->alignment_b
+            || a->alignment_c != b->alignment_c || a->vlen_tier != b->vlen_tier
+            || a->cost_fn != b->cost_fn)
+        return 0;
+    for (int i = 0; i < a->num_required_features; i++)
+        if (a->required_features[i] != b->required_features[i]) return 0;
+    return 1;
+}
+
+/* --------------------------------------------------- pre-init init paths
+ *
+ * Run as separate processes (ctest passes an argument) so registrations
+ * made before the first rvcl_init() are observable and every case starts
+ * from a clean lazy-init state. */
+
+static int preinit_fallback_case(void) {
+    printf("init-path: bounded + unbounded tuple registered before init\n");
+    rvcl_kernel_desc_t bounded = make_desc("pre_bounded");
+    bounded.max_m = 64;
+    rvcl_kernel_desc_t unbounded = make_desc("pre_unbounded");
+    CHECK(rvcl_register_kernel(&bounded, test_create) == RVCL_SUCCESS,
+            "pre-init bounded registration succeeds");
+    CHECK(rvcl_register_kernel(&unbounded, test_create) == RVCL_SUCCESS,
+            "pre-init unbounded registration succeeds");
+    CHECK(rvcl_init() == RVCL_SUCCESS,
+            "init accepts a legal pre-registered bounded+unbounded tuple");
+    CHECK(rvcl_registry_find_factory("pre_bounded") != NULL
+                    && rvcl_registry_find_factory("pre_unbounded") != NULL,
+            "pre-init entries survive init");
+    CHECK(rvcl_registry_find_factory("rvcl_matmul_f32_reference") != NULL,
+            "built-ins registered after a successful init");
+    printf(g_failures ? "UNIT-REGISTRY-PREINIT: %d failure(s)\n"
+                      : "UNIT-REGISTRY-PREINIT: all passed\n",
+            g_failures);
+    return g_failures ? 1 : 0;
+}
+
+static int preinit_lone_bounded_case(void) {
+    printf("init-path: lone bounded tuple registered before init\n");
+    rvcl_kernel_desc_t bounded = make_desc("pre_lone_bounded");
+    bounded.max_n = 32;
+    CHECK(rvcl_register_kernel(&bounded, test_create) == RVCL_SUCCESS,
+            "pre-init bounded registration succeeds");
+    CHECK(rvcl_init() == RVCL_ERROR_INTERNAL,
+            "init rejects a tuple without an unbounded kernel");
+    CHECK(rvcl_registry_count() == 1,
+            "failed init rolls back the built-ins it registered");
+    CHECK(rvcl_registry_find_factory("pre_lone_bounded") != NULL,
+            "pre-init entries survive the failed init");
+    CHECK(rvcl_registry_find_factory("rvcl_matmul_f32_reference") == NULL,
+            "no built-in is left behind by the failed init");
+    printf(g_failures ? "UNIT-REGISTRY-PREINIT: %d failure(s)\n"
+                      : "UNIT-REGISTRY-PREINIT: all passed\n",
+            g_failures);
+    return g_failures ? 1 : 0;
 }
 
 /* TC-AC1-02: first computation triggers initialization (must run before
@@ -515,11 +596,10 @@ static void tc10_fallback_invariant(void) {
 static void tc11_table_invariant(void) {
     printf("TC-AC1-11 table-wide fallback invariant\n");
     const int n = rvcl_registry_count();
-    int ok = 1, tuples = 0;
+    int ok = 1;
     for (int i = 0; i < n; i++) {
         const rvcl_kernel_desc_t *kd = rvcl_registry_get(i);
         if (!kd) continue;
-        tuples++;
         int covered = 0;
         for (int j = 0; j < n; j++) {
             const rvcl_kernel_desc_t *o = rvcl_registry_get(j);
@@ -532,21 +612,22 @@ static void tc11_table_invariant(void) {
         }
         if (!covered) ok = 0;
     }
-    CHECK(ok && tuples == n, "every live tuple has an unbounded fallback");
+    CHECK(ok, "every live tuple has an unbounded fallback");
 }
 
 /* TC-AC1-12: builtin order = dedicated (high tier -> low), then generic,
- * then fallback. */
+ * then fallback. Dedicated and generic entries must declare the vector
+ * features they depend on (FR1.5). */
 static void tc12_builtin_order(void) {
     printf("TC-AC1-12 builtin registration order\n");
     const int n = rvcl_registry_count();
-    int ok = 1;
+    const int vector = vector_build();
 
     for (int pass = 0; pass < 2; pass++) {
         const rvcl_dtype_t key = pass == 0 ? RVCL_DTYPE_FP32 : RVCL_DTYPE_FP16;
         int prev_cls = -1; /* 0 dedicated, 1 generic, 2 fallback */
         int prev_tier = 1 << 30;
-        int seen = 0;
+        int seen = 0, generic_count = 0;
         int group_ok = 1;
         for (int i = 0; i < n; i++) {
             const rvcl_kernel_desc_t *kd = rvcl_registry_get(i);
@@ -556,36 +637,50 @@ static void tc12_builtin_order(void) {
             int cls;
             if (kd->vlen_tier != RVCL_VLEN_TIER_ANY) {
                 cls = 0;
+                if (!has_feature(kd, RVCL_FEATURE_RVV)) group_ok = 0;
+                if (pass == 1 && !has_feature(kd, RVCL_FEATURE_FP16))
+                    group_ok = 0;
                 /* tiers must strictly descend among consecutive
                  * dedicated entries */
                 if (prev_cls == 0 && (int)kd->vlen_tier >= prev_tier)
                     group_ok = 0;
                 prev_tier = (int)kd->vlen_tier;
+            } else if (has_feature(kd, RVCL_FEATURE_RVV)) {
+                cls = 1; /* generic vector variant */
+                generic_count++;
+                if (pass == 1 && !has_feature(kd, RVCL_FEATURE_FP16))
+                    group_ok = 0;
             } else {
-                int needs_rvv = 0;
-                for (int f = 0; f < kd->num_required_features; f++)
-                    if (kd->required_features[f] == RVCL_FEATURE_RVV)
-                        needs_rvv = 1;
-                cls = needs_rvv ? 1 : 2;
+                cls = 2; /* fallback: no vector feature requirement */
+                if (kd->max_m != 0 || kd->max_n != 0 || kd->max_k != 0)
+                    group_ok = 0;
             }
             if (cls < prev_cls) group_ok = 0; /* never go backwards */
             prev_cls = cls;
         }
+        /* Vector builds expose exactly one generic entry per tuple;
+         * other builds must have no RVV entry at all. */
+        if (vector ? generic_count != 1 : generic_count != 0) group_ok = 0;
         if (pass == 0) CHECK(group_ok && seen >= 2, "f32 group ordered");
         if (pass == 1) CHECK(group_ok && seen >= 1, "f16 group ordered");
-        if (!group_ok) ok = 0;
     }
-    (void)ok; /* per-group CHECKs above carry the verdict */
 }
 
 /* TC-AC1-13: concurrent register / unregister / query. The interesting
- * race window is exercised under the ASan build. */
+ * race window is exercised under the ASan build.
+ *
+ * Capacity note: the test plan budgets 8 entries per A thread (8x8), but
+ * the 64-slot registry also holds the built-ins and the D-group target,
+ * so each A thread registers 4 names instead. */
 
 #define T13_THREADS_A 8
 #define T13_PER_A 4
 #define T13_THREADS_B 4
 #define T13_THREADS_C 4
 #define T13_QUERIES 2000
+/* B covers two A threads each, so the group removes the designated half
+ * of all A entries. */
+#define T13_UNREG_TOTAL (T13_THREADS_B * 2 * (T13_PER_A / 2))
 
 typedef struct {
     int tid;
@@ -593,46 +688,87 @@ typedef struct {
     int unreg_ok;
 } t13_arg_t;
 
+/* Start gate: every worker blocks until the last one is created, so the
+ * groups actually overlap instead of finishing in creation order. */
+static pthread_barrier_t g_t13_start;
+static std::atomic<int> g_t13_a_done(0);
+
+static int t13_wait_start(void) {
+    const int rc = pthread_barrier_wait(&g_t13_start);
+    return rc == 0 || rc == PTHREAD_BARRIER_SERIAL_THREAD;
+}
+
 static void *t13_register(void *p) {
     t13_arg_t *arg = (t13_arg_t *)p;
-    for (int i = 0; i < T13_PER_A; i++) {
-        char name[RVCL_KERNEL_NAME_MAX];
-        snprintf(name, sizeof(name), "t13_a_%d_%d", arg->tid, i);
-        rvcl_kernel_desc_t d = make_desc(name);
-        if (rvcl_register_kernel(&d, test_create) == RVCL_SUCCESS)
-            arg->reg_ok++;
+    if (t13_wait_start()) {
+        for (int i = 0; i < T13_PER_A; i++) {
+            char name[RVCL_KERNEL_NAME_MAX];
+            snprintf(name, sizeof(name), "t13_a_%d_%d", arg->tid, i);
+            rvcl_kernel_desc_t d = make_desc(name);
+            if (rvcl_register_kernel(&d, test_create) == RVCL_SUCCESS)
+                arg->reg_ok++;
+        }
     }
+    /* Published even on a gate failure so B-group waiters cannot spin. */
+    g_t13_a_done.fetch_add(1, std::memory_order_release);
     return NULL;
 }
 
 static void *t13_unregister(void *p) {
     t13_arg_t *arg = (t13_arg_t *)p;
-    for (int i = 0; i < T13_PER_A / 2; i++) {
-        char name[RVCL_KERNEL_NAME_MAX];
-        snprintf(name, sizeof(name), "t13_a_%d_%d", arg->tid, i);
-        if (rvcl_unregister_kernel(name) == RVCL_SUCCESS) arg->unreg_ok++;
+    if (!t13_wait_start()) return (void *)1;
+    for (int a = 0; a < 2; a++) {
+        const int a_tid = arg->tid * 2 + a;
+        for (int i = 0; i < T13_PER_A / 2; i++) {
+            char name[RVCL_KERNEL_NAME_MAX];
+            snprintf(name, sizeof(name), "t13_a_%d_%d", a_tid, i);
+            /* The A group may not have published the name yet: NOT_FOUND
+             * is a legal race outcome, so retry until the designated half
+             * is actually removed. Stop once every A thread has finished
+             * — a still-unknown name then means its registration failed. */
+            for (;;) {
+                if (rvcl_unregister_kernel(name) == RVCL_SUCCESS) {
+                    arg->unreg_ok++;
+                    break;
+                }
+                if (g_t13_a_done.load(std::memory_order_acquire)
+                        == T13_THREADS_A)
+                    break;
+                sched_yield();
+            }
+        }
     }
     return NULL;
 }
 
 static void *t13_query(void *p) {
-    t13_arg_t *arg = (t13_arg_t *)p;
-    (void)arg;
+    (void)p;
+    if (!t13_wait_start()) return (void *)1;
     for (int i = 0; i < T13_QUERIES; i++) {
         const int n = rvcl_registry_count();
         for (int j = 0; j < n; j += 7) {
-            const rvcl_kernel_desc_t *kd = rvcl_registry_get(j);
-            if (kd && kd->name[0] == '\0') return (void *)1; /* torn read */
+            /* The pointer is valid only while its entry stays registered
+             * (registry.h), so the loop exercises the call path without
+             * asserting descriptor content on a raced slot. */
+            (void)rvcl_registry_get(j);
         }
-        rvcl_registry_find_factory("t13_a_0_0");
+        (void)rvcl_registry_find_factory("t13_a_0_0");
     }
     return NULL;
 }
 
 static void *t13_same_name_unregister(void *p) {
     t13_arg_t *arg = (t13_arg_t *)p;
+    if (!t13_wait_start()) return (void *)1;
     if (rvcl_unregister_kernel("t13_dup_race") == RVCL_SUCCESS) arg->unreg_ok++;
     return NULL;
+}
+
+static void t13_spawn(pthread_t *thr, void *(*fn)(void *), t13_arg_t *arg) {
+    const int rc = pthread_create(thr, NULL, fn, arg);
+    if (rc == 0) return;
+    fprintf(stderr, "  FAIL: pthread_create: %s\n", strerror(rc));
+    exit(1); /* other workers already wait at the gate: abort cleanly */
 }
 
 static void tc13_concurrent(void) {
@@ -649,49 +785,101 @@ static void tc13_concurrent(void) {
     pthread_t ta[T13_THREADS_A], tb[T13_THREADS_B], tc[T13_THREADS_C], td[2];
     t13_arg_t aa[T13_THREADS_A], ab[T13_THREADS_B], ac[T13_THREADS_C], ad[2];
 
+    const int total = T13_THREADS_A + T13_THREADS_B + T13_THREADS_C + 2;
+    if (pthread_barrier_init(&g_t13_start, NULL, (unsigned)total) != 0) {
+        printf("  FAIL: start barrier init (line %d)\n", __LINE__);
+        g_failures++;
+        return;
+    }
+    g_t13_a_done.store(0, std::memory_order_relaxed);
+
     for (int i = 0; i < T13_THREADS_A; i++) {
         aa[i] = t13_arg_t {.tid = i, .reg_ok = 0, .unreg_ok = 0};
-        pthread_create(&ta[i], NULL, t13_register, &aa[i]);
+        t13_spawn(&ta[i], t13_register, &aa[i]);
     }
     for (int i = 0; i < T13_THREADS_B; i++) {
         ab[i] = t13_arg_t {.tid = i, .reg_ok = 0, .unreg_ok = 0};
-        pthread_create(&tb[i], NULL, t13_unregister, &ab[i]);
+        t13_spawn(&tb[i], t13_unregister, &ab[i]);
     }
     for (int i = 0; i < T13_THREADS_C; i++) {
         ac[i] = t13_arg_t {.tid = i, .reg_ok = 0, .unreg_ok = 0};
-        pthread_create(&tc[i], NULL, t13_query, &ac[i]);
+        t13_spawn(&tc[i], t13_query, &ac[i]);
     }
     /* two racers on the same name */
     for (int i = 0; i < 2; i++) {
         ad[i] = t13_arg_t {.tid = i, .reg_ok = 0, .unreg_ok = 0};
-        pthread_create(&td[i], NULL, t13_same_name_unregister, &ad[i]);
+        t13_spawn(&td[i], t13_same_name_unregister, &ad[i]);
     }
 
-    int reg_ok = 0, unreg_ok = 0, torn = 0;
+    int reg_ok = 0, unreg_ok = 0, thread_err = 0, dup_ok = 0;
     for (int i = 0; i < T13_THREADS_A; i++) {
-        pthread_join(ta[i], NULL);
+        void *ret = NULL;
+        pthread_join(ta[i], &ret);
+        if (ret) thread_err = 1;
         reg_ok += aa[i].reg_ok;
     }
     for (int i = 0; i < T13_THREADS_B; i++) {
-        pthread_join(tb[i], NULL);
+        void *ret = NULL;
+        pthread_join(tb[i], &ret);
+        if (ret) thread_err = 1;
         unreg_ok += ab[i].unreg_ok;
     }
     for (int i = 0; i < T13_THREADS_C; i++) {
         void *ret = NULL;
         pthread_join(tc[i], &ret);
-        if (ret) torn = 1;
+        if (ret) thread_err = 1;
     }
-    int dup_ok = 0;
     for (int i = 0; i < 2; i++) {
-        pthread_join(td[i], NULL);
+        void *ret = NULL;
+        pthread_join(td[i], &ret);
+        if (ret) thread_err = 1;
         dup_ok += ad[i].unreg_ok;
     }
+    pthread_barrier_destroy(&g_t13_start);
 
+    CHECK(thread_err == 0, "all worker threads ran");
     CHECK(reg_ok == T13_THREADS_A * T13_PER_A, "all concurrent registers ok");
+    CHECK(unreg_ok == T13_UNREG_TOTAL,
+            "every designated half was unregistered");
     CHECK(dup_ok == 1, "exactly one winner for the same-name race");
-    CHECK(torn == 0, "concurrent queries saw no torn descriptors");
     CHECK(rvcl_registry_count() == c0 + 1 + reg_ok - unreg_ok - dup_ok,
             "final count matches successful operations");
+
+    /* Every A entry is either fully intact or was removed: no partial
+     * registration survives the concurrent phase. */
+    int intact = 1, removed = 0;
+    for (int t = 0; t < T13_THREADS_A; t++) {
+        for (int i = 0; i < T13_PER_A; i++) {
+            char name[RVCL_KERNEL_NAME_MAX];
+            snprintf(name, sizeof(name), "t13_a_%d_%d", t, i);
+            const int idx = find_name_index(name);
+            if (idx < 0) {
+                removed++;
+                continue;
+            }
+            const rvcl_kernel_desc_t expected = make_desc(name);
+            const rvcl_kernel_desc_t *kd = rvcl_registry_get(idx);
+            if (!kd || !same_desc(kd, &expected)) intact = 0;
+        }
+    }
+    CHECK(intact, "every surviving entry is complete");
+    CHECK(removed == T13_UNREG_TOTAL,
+            "removed entries match the designated unregisters");
+
+    const int n = rvcl_registry_count();
+    int distinct = 1;
+    for (int i = 0; i < n && distinct; i++) {
+        const rvcl_kernel_desc_t *a = rvcl_registry_get(i);
+        if (!a) {
+            distinct = 0;
+            break;
+        }
+        for (int j = i + 1; j < n; j++) {
+            const rvcl_kernel_desc_t *b = rvcl_registry_get(j);
+            if (b && strcmp(a->name, b->name) == 0) distinct = 0;
+        }
+    }
+    CHECK(distinct, "iteration yields distinct names");
 
     /* cleanup the survivors */
     for (int t = 0; t < T13_THREADS_A; t++)
@@ -700,12 +888,15 @@ static void tc13_concurrent(void) {
             snprintf(name, sizeof(name), "t13_a_%d_%d", t, i);
             unregister_quiet(name);
         }
+    unregister_quiet("t13_dup_race");
     rvcl_dispatch_cache_clear();
     CHECK(rvcl_registry_count() == c0, "cleanup restores count");
 }
 
 /* TC-AC1-14: builtin entries exist per build configuration and every
- * name resolves. */
+ * name resolves. The enabled tier set is a build input (AC1), so this
+ * target receives the same RVCL_RVV_TIERS_<T> definitions as the library
+ * and asserts exactly that set. */
 static void tc14_builtin_entries(void) {
     printf("TC-AC1-14 builtin entries present and queryable\n");
     const int n = rvcl_registry_count();
@@ -720,15 +911,40 @@ static void tc14_builtin_entries(void) {
             "f32 unbounded reference present");
 
     if (vector_build()) {
-        static const int tiers[4] = {128, 256, 512, 1024};
-        for (int t = 0; t < 4; t++) {
+        int enabled[4];
+        int num_enabled = 0;
+#if defined(RVCL_RVV_TIERS_1024)
+        enabled[num_enabled++] = 1024;
+#endif
+#if defined(RVCL_RVV_TIERS_512)
+        enabled[num_enabled++] = 512;
+#endif
+#if defined(RVCL_RVV_TIERS_256)
+        enabled[num_enabled++] = 256;
+#endif
+#if defined(RVCL_RVV_TIERS_128)
+        enabled[num_enabled++] = 128;
+#endif
+        CHECK(num_enabled > 0, "vector build enables at least one tier");
+
+        int dedicated = 0, matched[4] = {0, 0, 0, 0};
+        for (int i = 0; i < n; i++) {
+            const rvcl_kernel_desc_t *kd = rvcl_registry_get(i);
+            if (!kd || kd->dtype_a != RVCL_DTYPE_FP32
+                    || kd->dtype_b != RVCL_DTYPE_FP32)
+                continue;
+            if (kd->vlen_tier == RVCL_VLEN_TIER_ANY) continue;
+            dedicated++;
+            for (int t = 0; t < num_enabled; t++)
+                if ((int)kd->vlen_tier == enabled[t]) matched[t]++;
+        }
+        CHECK(dedicated == num_enabled,
+                "exactly the build-enabled f32 tiers are registered");
+        for (int t = 0; t < num_enabled; t++) {
             char name[RVCL_KERNEL_NAME_MAX];
-            snprintf(name, sizeof(name), "rvcl_matmul_f32_rvv_%d", tiers[t]);
-            const int idx = find_name_index(name);
-            CHECK(idx >= 0, "per-tier f32 rvv entry present");
-            if (idx >= 0)
-                CHECK(rvcl_registry_get(idx)->vlen_tier == tiers[t],
-                        "tier entry declares its tier");
+            snprintf(name, sizeof(name), "rvcl_matmul_f32_rvv_%d", enabled[t]);
+            CHECK(find_name_index(name) >= 0, "enabled tier entry present");
+            CHECK(matched[t] == 1, "enabled tier registered exactly once");
         }
     } else {
         CHECK(rvcl_registry_find_factory("rvcl_matmul_f32_rvv_c") != NULL,
@@ -738,7 +954,18 @@ static void tc14_builtin_entries(void) {
     }
 }
 
-int main(void) {
+int main(int argc, char **argv) {
+    if (argc > 1) {
+        if (strcmp(argv[1], "--preinit-fallback") == 0)
+            return preinit_fallback_case();
+        if (strcmp(argv[1], "--preinit-lone-bounded") == 0)
+            return preinit_lone_bounded_case();
+        fprintf(stderr,
+                "usage: %s [--preinit-fallback|--preinit-lone-bounded]\n",
+                argv[0]);
+        return 2;
+    }
+
     tc02_first_compute_lazy_init(); /* must be first: fresh-process lazy init */
     CHECK(rvcl_init() == RVCL_SUCCESS, "explicit init after lazy path");
     tc01_register_full_fields();
